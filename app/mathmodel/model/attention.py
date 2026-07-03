@@ -28,7 +28,6 @@ class SelfAttentionRoPE(nn.Module):
         for layer in [self.Wq, self.Wk, self.Wv, self.Wo]:
             nn.init.normal_(layer.weight, std=0.02)
 
-        # FIX 1: chỉ lưu số dropout thô, không tính self.training ở đây
         self.dropout = dropout
 
     def forward(self, x, freqs_cis, attn_mask=None):
