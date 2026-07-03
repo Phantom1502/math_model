@@ -13,42 +13,27 @@ from .layers import RMSNorm, apply_rope
 
 
 class SelfAttentionRoPE(nn.Module):
-    """
-    Self-attention chuẩn, có RoPE áp lên Q/K, không bias trên các Linear.
-    Pre-Norm (RMSNorm) nằm bên trong — block không cần norm trước khi gọi.
-    """
-
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0
-
         self.n_heads = n_heads
         self.d_head  = d_model // n_heads
-        self.scale   = math.sqrt(self.d_head)
-
         self.norm = RMSNorm(d_model)
 
-        # no bias — LLaMA-style
         self.Wq = nn.Linear(d_model, d_model, bias=False)
         self.Wk = nn.Linear(d_model, d_model, bias=False)
         self.Wv = nn.Linear(d_model, d_model, bias=False)
         self.Wo = nn.Linear(d_model, d_model, bias=False)
 
-        # Wo nằm trên đường residual — bị _scaled_init() trong block ghi đè sau
         for layer in [self.Wq, self.Wk, self.Wv, self.Wo]:
             nn.init.normal_(layer.weight, std=0.02)
 
-        self.dropout = nn.Dropout(dropout)
+        # FIX 1: chỉ lưu số dropout thô, không tính self.training ở đây
+        self.dropout = dropout
 
-    def forward(
-        self,
-        x        : torch.Tensor,
-        freqs_cis: torch.Tensor,
-        attn_mask: torch.Tensor = None,
-    ) -> torch.Tensor:
+    def forward(self, x, freqs_cis, attn_mask=None):
         B, T, D = x.shape
         h, dh   = self.n_heads, self.d_head
-
         x_normed = self.norm(x)
 
         q = self.Wq(x_normed).view(B, T, h, dh).transpose(1, 2)
@@ -58,12 +43,14 @@ class SelfAttentionRoPE(nn.Module):
         q = apply_rope(q, freqs_cis)
         k = apply_rope(k, freqs_cis)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
-        if attn_mask is not None:
-            scores = scores + attn_mask
+        dropout_p = self.dropout if self.training else 0.0
 
-        weights = self.dropout(F.softmax(scores, dim=-1))
-        out     = torch.matmul(weights, v)
+        out = F.scaled_dot_product_attention(
+            query=q, key=k, value=v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )
 
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         return self.Wo(out)
