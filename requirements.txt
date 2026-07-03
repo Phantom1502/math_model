@@ -1,0 +1,13 @@
+# ── Core ML / training (app/memlm) ──────────────────────────────────────
+torch>=2.1
+transformers>=4.38
+datasets>=2.18
+accelerate>=0.27
+
+# ── Data / chart codec (app/utils) ──────────────────────────────────────
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0          # engine đọc/ghi .parquet (ưu tiên dùng nếu có)
+fastparquet>=2024.5.0  # engine parquet dự phòng; từ 2023.x dùng calendar versioning
+
+pdfplumber
