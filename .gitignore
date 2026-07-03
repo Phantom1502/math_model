@@ -1,4 +1,3 @@
-app/custom_tokenizer/
 .venv/
 data/
 app/model/__pycache__/
