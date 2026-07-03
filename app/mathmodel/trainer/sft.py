@@ -26,6 +26,24 @@ class SFTTrainer(BaseTrainer):
     pass
 
 
+def _maybe_save_best(trainer: SFTTrainer, val_loss: float, cfg) -> bool:
+    """Lưu sft_best.pt nếu val_loss hiện tại thấp nhất từ trước tới giờ.
+    Tách riêng vì cần gọi ở CẢ 2 chỗ: giữa epoch (theo eval_every) và
+    cuối mỗi epoch (dataset SFT nhỏ nên số step/epoch có thể ít hơn
+    eval_every rất nhiều — nếu chỉ check ở nhánh eval_every, best sẽ
+    gần như không bao giờ được lưu với dataset nhỏ)."""
+    if val_loss < trainer.best_val_loss:
+        trainer.best_val_loss = val_loss
+        save_checkpoint(
+            f"{cfg.train.save_dir}/sft_best.pt",
+            trainer.model, trainer.optimizer, trainer.scheduler,
+            trainer.global_step, chunk_idx=0, val_loss=val_loss,
+            model_cfg=cfg.model,
+        )
+        return True
+    return False
+
+
 def run_sft(
     cfg,
     model,
