@@ -1,7 +1,15 @@
 """
-model/attention.py — Self-Attention với RoPE
-==============================================
-SelfAttentionRoPE : thay nn.MultiheadAttention, hỗ trợ RoPE và no-bias
+model/attention.py — Self-Attention với RoPE + KV-cache
+=========================================================
+SelfAttentionRoPE : thay nn.MultiheadAttention, hỗ trợ RoPE, no-bias,
+                     và KV-cache cho generate() (decode 1 token/bước
+                     thay vì forward lại toàn bộ sequence mỗi lần).
+
+Tương thích ngược: gọi forward() không truyền past_kv (mặc định None)
+cho kết quả HỆT như code cũ — chỉ thêm giá trị trả về thứ 2 (present_kv),
+các nơi gọi cũ (train loop, benchmark log-prob) không dùng KV-cache nên
+không bị ảnh hưởng, chỉ cần nhận thêm 1 giá trị bỏ qua nếu muốn (xem
+model/lm.py — đã xử lý việc này ở tầng MemoryLM.forward qua use_cache).
 """
 
 import math
@@ -30,7 +38,22 @@ class SelfAttentionRoPE(nn.Module):
 
         self.dropout = dropout
 
-    def forward(self, x, freqs_cis, attn_mask=None):
+    def forward(self, x, freqs_cis, attn_mask=None, past_kv=None):
+        """
+        freqs_cis : slice CHÍNH XÁC ứng với vị trí tuyệt đối của x — đã được
+                    cắt sẵn ở MemoryLM.forward theo start_pos. Hàm này KHÔNG
+                    tự cắt lại (apply_rope vẫn làm freqs_cis[:T] nhưng T ở
+                    đây luôn khớp sẵn nên là no-op, giữ nguyên layers.py).
+
+        past_kv   : tuple (k_cache, v_cache), mỗi cái shape
+                    (B, n_heads, T_past, d_head) — hoặc None nếu không dùng
+                    cache (huấn luyện) hoặc đây là bước prefill đầu tiên.
+
+        Returns   : (out, present_kv)
+                    present_kv luôn được trả về (kể cả khi past_kv=None) —
+                    là (k, v) SAU khi đã nối với past_kv (nếu có), để tầng
+                    trên (MemoryLM) build kv_cache mới truyền cho bước sau.
+        """
         B, T, D = x.shape
         h, dh   = self.n_heads, self.d_head
         x_normed = self.norm(x)
@@ -42,8 +65,18 @@ class SelfAttentionRoPE(nn.Module):
         q = apply_rope(q, freqs_cis)
         k = apply_rope(k, freqs_cis)
 
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)   # (B, h, T_past + T, dh)
+            v = torch.cat([past_v, v], dim=2)
+
+        present_kv = (k, v)
+
         dropout_p = self.dropout if self.training else 0.0
 
+        # attn_mask=None + is_causal=False khi decode 1 token: đúng về mặt
+        # nhân quả vì query (1 token mới nhất) được phép attend TOÀN BỘ
+        # key trong cache (đều là quá khứ so với nó) — không cần mask tam giác.
         out = F.scaled_dot_product_attention(
             query=q, key=k, value=v,
             attn_mask=attn_mask,
@@ -52,4 +85,4 @@ class SelfAttentionRoPE(nn.Module):
         )
 
         out = out.transpose(1, 2).contiguous().view(B, T, D)
-        return self.Wo(out)
+        return self.Wo(out), present_kv

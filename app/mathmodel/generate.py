@@ -1,8 +1,25 @@
 """
 generate.py — Sinh văn bản từ model đã train
 ================================================
-Sliding window đơn giản: khi context vượt max_seq thì cắt phần đầu,
-không cần prefill hay flush vào memory.
+CẬP NHẬT: dùng KV-cache thay vì forward lại toàn bộ sequence ở mỗi token
+mới. generate() giữ NGUYÊN chữ ký hàm (không thêm tham số) nên mọi nơi
+đang gọi nó (benchmark_hellaswag.py không dùng hàm này, nhưng
+scripts/label_prm_data.py có) không cần sửa gì.
+
+Trước:  mỗi token mới → forward lại TOÀN BỘ sequence đã có → O(N^2)
+Sau :   prefill prompt 1 lần (lấy kv_cache) → mỗi token mới chỉ forward
+        đúng 1 token, tái dùng kv_cache → O(N)
+
+Đây là chỗ tốn compute nhất trong scripts/label_prm_data.py (Stage 2,
+Math-Shepherd rollout gọi generate() rất nhiều lần/bài toán), nên cải
+thiện này có ảnh hưởng trực tiếp tới tốc độ toàn pipeline.
+
+GIỚI HẠN (xem thêm model/lm.py): freqs_cis chỉ precompute cho max_seq*2
+vị trí. Nếu len(prompt đã cắt) + max_new vượt quá max_seq*2, max_new sẽ
+tự động bị giảm xuống cho vừa (không còn cắt sliding-window GIỮA CHỪNG
+generate như bản cũ, vì làm vậy sẽ làm lệch vị trí RoPE tuyệt đối của các
+token còn lại trong cache — chỉ cắt PROMPT một lần trước khi bắt đầu,
+giống hệt bản cũ).
 
 Usage:
     from generate import load_model_for_inference, generate
@@ -45,7 +62,7 @@ def _sample_next(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Generate
+# Generate (dùng KV-cache)
 # ══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -62,11 +79,13 @@ def generate(
     add_bos        : bool  = False,
 ) -> str:
     """
-    Sinh văn bản từ prompt với sliding window khi context vượt max_seq.
+    Sinh văn bản từ prompt, dùng KV-cache để decode nhanh (không forward
+    lại toàn bộ sequence mỗi token mới).
 
     Args:
         prompt        : văn bản đầu vào
-        max_new       : số token tối đa sinh thêm
+        max_new       : số token tối đa sinh thêm (có thể tự giảm nếu vượt
+                        rope_buffer_limit — xem docstring đầu file)
         temperature   : nhiệt độ sampling
         top_k         : top-k filtering
         top_p         : nucleus sampling
@@ -74,18 +93,9 @@ def generate(
         add_bos       : True → thêm bos_id vào đầu prompt trước khi generate.
 
                         BẮT BUỘC bật khi generate từ checkpoint đã qua SFT
-                        (SFTDataset._build_example luôn thêm bos_id ở đầu
-                        MỌI sample lúc train — token "Problem:" luôn nằm ở
-                        vị trí 1, không phải vị trí 0). Nếu generate() không
-                        thêm lại bos ở đây, toàn bộ vị trí token (và do đó
-                        RoPE) bị lệch 1 so với lúc train, phá format đã học
-                        dù model đã hội tụ tốt.
-
-                        Mặc định False để KHÔNG đổi hành vi cũ — data pretrain
-                        (TokenChunkDataset trong dataset.py) không hề chèn
-                        bos/eos giữa các đoạn cắt, nên generate cho model
-                        pretrain-only / dùng trong benchmark.py vẫn nên giữ
-                        add_bos=False như trước.
+                        (xem giải thích gốc — SFTDataset luôn thêm bos_id ở
+                        đầu mọi sample lúc train). Mặc định False để không
+                        đổi hành vi cho model pretrain-only / benchmark.py.
     """
     device  = next(model.parameters()).device
     max_seq = cfg.model.max_seq
@@ -95,26 +105,45 @@ def generate(
     if add_bos:
         prompt_ids = [tokenizer.bos_id] + prompt_ids
 
-    # Cắt prompt về max_seq nếu quá dài
+    # Cắt prompt về max_seq nếu quá dài — CHỈ cắt 1 lần trước khi generate,
+    # giống hệt bản cũ. Không sliding-window giữa chừng vì sẽ phá vị trí
+    # RoPE tuyệt đối của các token đã nằm trong kv_cache.
     active = prompt_ids[-max_seq:] if len(prompt_ids) > max_seq else prompt_ids
-    ids    = torch.tensor([active], dtype=torch.long, device=device)
+
+    # freqs_cis chỉ precompute cho max_seq*2 vị trí (model/lm.py) — tổng độ
+    # dài (active + max_new) không được vượt quá giới hạn này.
+    rope_buffer_limit = max_seq * 2
+    if len(active) + max_new > rope_buffer_limit:
+        max_new = max(rope_buffer_limit - len(active), 0)
+
+    ids = torch.tensor([active], dtype=torch.long, device=device)
+    T0  = ids.size(1)
+
+    # ── Prefill: forward toàn bộ prompt MỘT LẦN, lấy kv_cache ban đầu ──────
+    logits, kv_cache = model(
+        ids, attn_mask=causal_mask(T0, device),
+        use_cache=True, start_pos=0,
+    )
+    cur_pos = T0
 
     generated = []
 
-    for _ in range(max_new):
-        # Sliding window: giữ max_seq token cuối
-        if ids.size(1) > max_seq:
-            ids = ids[:, -max_seq:]
-
-        T      = ids.size(1)
-        logits = model(ids, attn_mask=causal_mask(T, device))
+    for step in range(max_new):
         next_tok = _sample_next(logits[:, -1, :], temperature, top_k, top_p)
-
         generated.append(next_tok)
-        ids = torch.cat([ids, torch.tensor([[next_tok]], device=device)], dim=1)
 
         if next_tok == tokenizer.eos_id:
             break
+        if step == max_new - 1:
+            break
+
+        # ── Decode: chỉ forward ĐÚNG 1 token mới, tái dùng kv_cache ────────
+        next_ids = torch.tensor([[next_tok]], dtype=torch.long, device=device)
+        logits, kv_cache = model(
+            next_ids, attn_mask=None,
+            kv_cache=kv_cache, start_pos=cur_pos, use_cache=True,
+        )
+        cur_pos += 1
 
     if new_token_only:
         return tokenizer.decode(generated)

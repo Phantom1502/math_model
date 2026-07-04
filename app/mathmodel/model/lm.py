@@ -8,6 +8,33 @@ Kỹ thuật cốt lõi:
     - RoPE                : áp lên Q/K trong self-attention, không có pos_emb tuyệt đối
     - Scaled init         : 1/sqrt(2*n_layers) cho projection trên đường residual
     - Weight tying        : lm_head.weight = token_emb.weight
+    - KV-cache (mới)      : forward(..., use_cache=True) trả thêm kv_cache để
+                             generate.py decode 1 token/bước thay vì forward
+                             lại toàn bộ sequence mỗi lần sinh token mới.
+
+────────────────────────────────────────────────────────────────────────────
+TƯƠNG THÍCH NGƯỢC — QUAN TRỌNG:
+
+use_cache mặc định = False. Khi đó forward() trả về DUY NHẤT logits, y hệt
+hành vi cũ 100% (freqs_cis luôn lấy từ vị trí 0, không quan tâm start_pos).
+Toàn bộ code train (trainer/base.py) và benchmark (benchmark.py) gọi
+model(ids, attn_mask=mask) không cần sửa gì.
+
+use_cache=True chỉ dùng trong generate.py cho suy luận autoregressive:
+    - Bước prefill : model(prompt_ids, attn_mask=causal_mask(T,...),
+                           use_cache=True, start_pos=0)
+                     → trả về (logits, kv_cache)
+    - Bước decode  : model(next_token_id,  # shape (1,1)
+                           attn_mask=None, use_cache=True,
+                           kv_cache=kv_cache, start_pos=cur_pos)
+                     → trả về (logits, kv_cache_mới)
+
+GIỚI HẠN: freqs_cis chỉ precompute cho max_seq*2 vị trí (xem
+precompute_freqs_cis bên dưới). Do đó tổng số vị trí dùng trong một lần
+generate (start_pos + T) không được vượt quá max_seq*2 — generate.py tự
+giới hạn max_new theo ràng buộc này (không còn sliding-window giữa chừng
+như bản cũ, vì cắt bớt kv_cache giữa chừng sẽ làm lệch vị trí RoPE tuyệt
+đối của phần còn lại).
 """
 
 import torch
@@ -56,10 +83,26 @@ class MemoryLM(nn.Module):
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, input_ids: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attn_mask: torch.Tensor = None,
+        kv_cache             = None,
+        start_pos: int        = 0,
+        use_cache: bool       = False,
+    ):
         """
-        input_ids : (B, T)
-        Returns   : logits (B, T, vocab_size)
+        input_ids : (B, T) — T = toàn bộ prompt lúc prefill/train, hoặc T=1
+                    lúc decode từng bước với use_cache=True.
+        kv_cache  : list[tuple(k,v)] độ dài n_layers — cache của TỪNG layer
+                    từ (các) bước gọi trước đó. None nếu là bước prefill
+                    hoặc không dùng cache.
+        start_pos : vị trí tuyệt đối của token ĐẦU TIÊN trong input_ids —
+                    dùng để lấy đúng slice RoPE (chỉ có tác dụng khi
+                    use_cache=True; bỏ qua khi use_cache=False để giữ
+                    nguyên hành vi cũ).
+        use_cache : False (mặc định) → trả về logits (giống hệt bản cũ).
+                    True             → trả về (logits, new_kv_cache).
         """
         B, T   = input_ids.shape
         device = input_ids.device
@@ -67,10 +110,24 @@ class MemoryLM(nn.Module):
         x         = self.drop(self.token_emb(input_ids))
         freqs_cis = self.freqs_cis.to(device)
 
-        for block in self.blocks:
-            x = block(x, freqs_cis=freqs_cis, attn_mask=attn_mask)
+        if use_cache:
+            freqs_cis_slice = freqs_cis[start_pos : start_pos + T]
+        else:
+            freqs_cis_slice = freqs_cis[:T]
 
-        return self.lm_head(self.norm_out(x))
+        new_kv_cache = [] if use_cache else None
+
+        for i, block in enumerate(self.blocks):
+            past_kv = kv_cache[i] if (use_cache and kv_cache is not None) else None
+            x, present_kv = block(x, freqs_cis=freqs_cis_slice, attn_mask=attn_mask, past_kv=past_kv)
+            if use_cache:
+                new_kv_cache.append(present_kv)
+
+        logits = self.lm_head(self.norm_out(x))
+
+        if use_cache:
+            return logits, new_kv_cache
+        return logits
 
 
 def causal_mask(T: int, device: torch.device) -> torch.Tensor:
