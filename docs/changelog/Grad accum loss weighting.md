@@ -94,6 +94,14 @@ def train_one_batch(self, batch, accum_step, total_valid_tokens):
 1. **Pass đếm trước (chính xác nhất):** trước khi vào loop accumulate, duyệt qua các micro-batch sắp dùng và cộng `(labels != -100).sum()`. Cách này được HuggingFace `Trainer` và Unsloth dùng.
 2. **Ước lượng nhanh (kém chính xác hơn):** nếu độ dài sequence tương đối đồng đều / ít padding, có thể dùng gần đúng `grad_accum * micro_batch_size * seq_len`, chấp nhận sai số nhỏ để tránh thêm 1 pass.
 
+### Triển khai đầy đủ trong vòng lặp training
+
+`train_loader` được duyệt tuần tự từng micro-batch một, nên để đếm trước `total_valid_tokens` cho *cả cửa sổ accumulation*, cần gom (buffer) đủ `grad_accum` micro-batch lại trước khi tính, thay vì tính rải rác theo `accum_step % grad_accum` như bản cũ. Điểm trigger optimizer step cũng đổi theo: dựa vào việc buffer đã đầy (hoặc hết dữ liệu ở cuối epoch), thay vì dựa vào chỉ số tuyệt đối `accum_step`. Chi tiết code xem trong `trainer/base.py` đã cập nhật (`train_one_batch`, `_run_accum_window`, `train_one_chunk`).
+
+**Lưu ý quan trọng về cửa sổ cuối epoch:** nếu `len(train_loader) % grad_accum != 0`, cửa sổ accumulation cuối cùng của epoch sẽ ngắn hơn bình thường. Điều này không gây sai lệch trọng số vì `total_valid_tokens` vẫn được tính đúng theo đúng số micro-batch thực tế có trong cửa sổ đó — chỉ là effective batch size của riêng bước optimizer step cuối epoch nhỏ hơn các bước khác, tương tự "drop_last=False" trong DataLoader thông thường.
+
+**Lưu ý về memory:** buffer chỉ giữ dữ liệu thô (`input_ids`, `labels`) của `grad_accum` micro-batch, không giữ activation/gradient — vì `backward()` vẫn được gọi ngay trong `train_one_batch` cho từng micro-batch một (không đợi cả cửa sổ mới backward). Overhead memory thêm không đáng kể so với bản cũ.
+
 ## Việc cần làm (checklist)
 
 - [ ] Đổi `reduction` trong `compute_loss` từ `mean` → `sum`.
