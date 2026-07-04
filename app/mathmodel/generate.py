@@ -59,6 +59,7 @@ def generate(
     top_k          : int   = 50,
     top_p          : float = 0.95,
     new_token_only : bool  = False,
+    add_bos        : bool  = False,
 ) -> str:
     """
     Sinh văn bản từ prompt với sliding window khi context vượt max_seq.
@@ -70,12 +71,29 @@ def generate(
         top_k         : top-k filtering
         top_p         : nucleus sampling
         new_token_only: True → chỉ trả về phần sinh thêm
+        add_bos       : True → thêm bos_id vào đầu prompt trước khi generate.
+
+                        BẮT BUỘC bật khi generate từ checkpoint đã qua SFT
+                        (SFTDataset._build_example luôn thêm bos_id ở đầu
+                        MỌI sample lúc train — token "Problem:" luôn nằm ở
+                        vị trí 1, không phải vị trí 0). Nếu generate() không
+                        thêm lại bos ở đây, toàn bộ vị trí token (và do đó
+                        RoPE) bị lệch 1 so với lúc train, phá format đã học
+                        dù model đã hội tụ tốt.
+
+                        Mặc định False để KHÔNG đổi hành vi cũ — data pretrain
+                        (TokenChunkDataset trong dataset.py) không hề chèn
+                        bos/eos giữa các đoạn cắt, nên generate cho model
+                        pretrain-only / dùng trong benchmark.py vẫn nên giữ
+                        add_bos=False như trước.
     """
     device  = next(model.parameters()).device
     max_seq = cfg.model.max_seq
     model.eval()
 
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if add_bos:
+        prompt_ids = [tokenizer.bos_id] + prompt_ids
 
     # Cắt prompt về max_seq nếu quá dài
     active = prompt_ids[-max_seq:] if len(prompt_ids) > max_seq else prompt_ids

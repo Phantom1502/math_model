@@ -88,15 +88,7 @@ def run_sft(
             if trainer.global_step > 0 and trainer.global_step % cfg.train.eval_every == 0:
                 val_loss = trainer.evaluate(val_loader)
                 log_eval(val_loss, step=trainer.global_step)
-
-                if val_loss < trainer.best_val_loss:
-                    trainer.best_val_loss = val_loss
-                    save_checkpoint(
-                        f"{cfg.train.save_dir}/sft_best.pt",
-                        trainer.model, trainer.optimizer, trainer.scheduler,
-                        trainer.global_step, chunk_idx=0, val_loss=val_loss,
-                        model_cfg=cfg.model,
-                    )
+                _maybe_save_best(trainer, val_loss, cfg)
 
             if trainer.global_step > 0 and trainer.global_step % cfg.train.save_every == 0:
                 save_checkpoint(
@@ -108,6 +100,8 @@ def run_sft(
 
         val_loss = trainer.evaluate(val_loader)
         log_eval(val_loss, step=trainer.global_step, prefix=f"  [Epoch {epoch + 1} end] ")
+        if _maybe_save_best(trainer, val_loss, cfg):
+            print(f"  ✓ Cập nhật sft_best.pt (val_loss={val_loss:.4f})")
 
     save_checkpoint(
         f"{cfg.train.save_dir}/sft_final.pt",
