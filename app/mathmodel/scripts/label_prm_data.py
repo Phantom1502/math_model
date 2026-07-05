@@ -46,7 +46,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from generate import load_model_for_inference, generate
+from generate import load_model_for_inference, generate, generate_batch
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -91,68 +91,6 @@ def build_partial_prompt(base_prompt: str, steps: list[str], upto: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Math-Shepherd rollout cho 1 lời giải
-# ══════════════════════════════════════════════════════════════════════════
-
-def label_solution_steps(
-    model, tokenizer, cfg,
-    base_prompt : str,
-    steps       : list[str],
-    ground_truth: str,
-    k               : int   = 4,
-    max_new_rollout : int   = 100,
-    temperature     : float = 0.8,
-) -> tuple[list[str], list[float]]:
-    """
-    Với 1 lời giải đã tách step, gán nhãn từng step bằng Monte Carlo rollout.
-
-    Với step CUỐI CÙNG: không cần rollout (đã có final_answer của chính lời
-    giải này), coi trực tiếp correct/incorrect theo answer đã sinh — tiết
-    kiệm k lần generate không cần thiết.
-    """
-    labels, ratios = [], []
-
-    for i in range(len(steps)):
-        if i == len(steps) - 1:
-            # Step cuối: answer của chính lời giải này chính là kết quả của step này.
-            final = extract_answer(build_partial_prompt(base_prompt, steps, i + 1))
-            ratio = None  # không rollout, đánh dấu để phân biệt khi đọc lại log
-            is_correct = (extract_answer_from_full(steps, base_prompt, ground_truth))
-            labels.append("correct" if is_correct else "incorrect")
-            ratios.append(1.0 if is_correct else 0.0)
-            continue
-
-        partial = build_partial_prompt(base_prompt, steps, i + 1)
-        n_correct = 0
-        for _ in range(k):
-            continuation = generate(
-                model, tokenizer, cfg, partial,
-                max_new=max_new_rollout, temperature=temperature,
-                top_k=50, top_p=0.95, new_token_only=True,
-            )
-            ans = extract_answer(continuation)
-            if ans is not None and ans == ground_truth:
-                n_correct += 1
-
-        ratio = n_correct / k
-        ratios.append(ratio)
-        if ratio >= 0.6:
-            labels.append("correct")
-        elif ratio <= 0.2:
-            labels.append("incorrect")
-        else:
-            labels.append("uncertain")
-
-    return labels, ratios
-
-
-def extract_answer_from_full(steps, base_prompt, ground_truth):
-    # Placeholder không dùng — final_answer thật được truyền từ ngoài vào
-    # (xem label_dataset). Giữ hàm rõ ràng thay vì nhét logic ẩn vào nhánh trên.
-    raise NotImplementedError
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # Driver chính
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -175,12 +113,13 @@ def label_dataset(
         question     = extract_question(prompt)
 
         solutions_out = []
-        for _ in range(n_solutions):
-            full_text = generate(
-                model, tokenizer, cfg, prompt,
-                max_new=max_new_solution, temperature=temperature_solution,
-                top_k=50, top_p=0.95, new_token_only=True,
-            )
+        full_texts = generate_batch(
+            model, tokenizer, cfg, prompt,
+            batch_size=n_solutions,
+            max_new=max_new_solution, temperature=temperature_solution,
+            top_k=50, top_p=0.95,
+        )
+        for full_text in full_texts:
             steps        = extract_steps(full_text)
             final_answer = extract_answer(full_text)
 
@@ -196,13 +135,14 @@ def label_dataset(
                     continue
 
                 partial = build_partial_prompt(prompt, steps, i + 1)
+                conts = generate_batch(
+                    model, tokenizer, cfg, partial,
+                    batch_size=k,
+                    max_new=max_new_rollout, temperature=temperature_rollout,
+                    top_k=50, top_p=0.95,
+                )
                 n_correct = 0
-                for _ in range(k):
-                    cont = generate(
-                        model, tokenizer, cfg, partial,
-                        max_new=max_new_rollout, temperature=temperature_rollout,
-                        top_k=50, top_p=0.95, new_token_only=True,
-                    )
+                for cont in conts:
                     ans = extract_answer(cont)
                     if ans is not None and ans == ground_truth:
                         n_correct += 1
@@ -278,12 +218,14 @@ def main():
     rng.shuffle(all_problems)
     problems = all_problems[:args.n_problems]
 
-    # Ước lượng chi phí trước khi chạy — cảnh báo nếu quá lớn
+    # Ước lượng số lần GỌI model (không phải batch item) — sau khi batch hoá,
+    # đây mới là con số quyết định tốc độ thật, không phải tổng continuation.
     avg_steps_guess = 4  # ước lượng thô để cảnh báo, không ảnh hưởng logic
-    est_calls = args.n_problems * args.n_solutions * (1 + (avg_steps_guess - 1) * args.k)
-    print(f"\nƯớc lượng số lần gọi generate(): ~{est_calls:,} "
-          f"({args.n_problems} bài × {args.n_solutions} lời giải × (1 + ~{avg_steps_guess-1} step × {args.k} rollout))")
-    print("Nếu số này quá lớn so với thời gian bạn có, giảm --n-problems/--n-solutions/--k trước khi chạy full.\n")
+    est_model_calls = args.n_problems * (1 + (avg_steps_guess - 1))
+    print(f"\nƯớc lượng số lần gọi model (đã batch hoá theo n_solutions/k): ~{est_model_calls:,} "
+          f"({args.n_problems} bài × (1 lần sinh N lời giải + ~{avg_steps_guess-1} step rollout))")
+    print(f"Mỗi lần gọi xử lý batch={max(args.n_solutions, args.k)} sequence song song — "
+          f"nhanh hơn nhiều so với gọi generate() tuần tự.\n")
 
     results = label_dataset(
         model, tokenizer, cfg, problems,
