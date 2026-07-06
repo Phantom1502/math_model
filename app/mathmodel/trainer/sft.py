@@ -71,32 +71,40 @@ def run_sft(
     print(f"  SFT — {n_epochs} epoch(s) trên {len(train_loader.dataset)} samples")
     print(f"{'='*60}")
 
-    val_loss = float("inf")
+    grad_accum = cfg.train.grad_accum
+    val_loss   = float("inf")
 
     for epoch in range(n_epochs):
         trainer.model.train()
         print(f"\n── Epoch {epoch + 1}/{n_epochs} ──")
 
-        for accum_step, batch in enumerate(train_loader):
-            loss = trainer.train_one_batch(batch, accum_step)
-            trainer.logger.update(loss)
+        accum_buffer = []
 
-            if trainer.logger.should_log():
-                lr = trainer.scheduler.get_last_lr()[0]
-                trainer.logger.flush(step=trainer.global_step, lr=lr)
+        for batch in train_loader:
+            accum_buffer.append(batch)
 
-            if trainer.global_step > 0 and trainer.global_step % cfg.train.eval_every == 0:
-                val_loss = trainer.evaluate(val_loader)
-                log_eval(val_loss, step=trainer.global_step)
-                _maybe_save_best(trainer, val_loss, cfg)
+            if len(accum_buffer) == grad_accum:
+                trainer._run_accum_window(accum_buffer)
+                accum_buffer = []
 
-            if trainer.global_step > 0 and trainer.global_step % cfg.train.save_every == 0:
-                save_checkpoint(
-                    f"{cfg.train.save_dir}/sft_step_{trainer.global_step}.pt",
-                    trainer.model, trainer.optimizer, trainer.scheduler,
-                    trainer.global_step, chunk_idx=0,
-                    model_cfg=cfg.model,
-                )
+                if trainer.global_step > 0 and trainer.global_step % cfg.train.eval_every == 0:
+                    val_loss = trainer.evaluate(val_loader)
+                    log_eval(val_loss, step=trainer.global_step)
+                    _maybe_save_best(trainer, val_loss, cfg)
+
+                if trainer.global_step > 0 and trainer.global_step % cfg.train.save_every == 0:
+                    save_checkpoint(
+                        f"{cfg.train.save_dir}/sft_step_{trainer.global_step}.pt",
+                        trainer.model, trainer.optimizer, trainer.scheduler,
+                        trainer.global_step, chunk_idx=0,
+                        model_cfg=cfg.model,
+                    )
+
+        # Cửa sổ cuối epoch: số batch còn lại có thể ngắn hơn grad_accum,
+        # vẫn chạy nốt để không bỏ sót dữ liệu/gradient (giống train_one_chunk).
+        if accum_buffer:
+            trainer._run_accum_window(accum_buffer)
+            accum_buffer = []
 
         val_loss = trainer.evaluate(val_loader)
         log_eval(val_loss, step=trainer.global_step, prefix=f"  [Epoch {epoch + 1} end] ")
