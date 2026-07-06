@@ -13,6 +13,11 @@ Hoặc trong notebook cell:
     main(get_100m_config())
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 
 from config import get_100m_config, get_small_config, get_110m_config
@@ -123,14 +128,9 @@ def main(cfg=None, start_chunk: int = 0, reset_lr_for_new_round: bool = False):
             text_col    =cfg.data.parquet_text_col,
             start_chunk =start_chunk,
         )
-        
-    # ── Thêm vào train.py ────────────────────────────────────────────────────────
-    # Thêm case "mix" vào if/elif chain trong hàm main(), sau case "parquet":
 
     elif cfg.data.source == "mix":
         data_loader_gen = ChunkedMixLoader(cfg, tokenizer, start_chunk=start_chunk)
-
-    # (giữ nguyên else raise ValueError bên dưới)
 
     else:
         raise ValueError(

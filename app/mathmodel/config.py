@@ -173,11 +173,13 @@ def get_110m_config() -> Config:
     cfg.data.chunk_size  = 20_000
     cfg.data.seg_len     = 512
     
+    # batch 32, grad_accum 64 → effective batch 2048, LR 3e-4, warmup 200 steps, decay cycle 10_000 steps
+    # estimated tokens: 32 * 64 * 10_000 * 512 = 10,485,760,000 tokens → ~10B tokens
     cfg.train.lr                    = 3e-4
-    cfg.train.warmup_steps          = 500
-    cfg.train.lr_decay_cycle_steps  = 100_000  
+    cfg.train.warmup_steps          = 200
+    cfg.train.lr_decay_cycle_steps  = 10_000   
     cfg.train.lr_min_ratio          = 0.1
-    cfg.train.batch_size  = 8
+    cfg.train.batch_size  = 32
     cfg.train.grad_accum  = 64
     cfg.train.total_chunks          = -1
     return cfg

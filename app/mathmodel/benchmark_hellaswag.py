@@ -13,6 +13,11 @@ Usage:
     python benchmark_hellaswag.py ckpt_10.pt ckpt_50.pt --n-samples 200
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
