@@ -2,10 +2,21 @@
 train_listwise.py — Entry point chạy Stage 3c: Plackett-Luce/PRO listwise training
 ===========================================================
 Điều kiện trước khi chạy:
-    1. Đã có checkpoint SFT (Stage 1) — vd checkpoints_sft/sft_best.pt
+    1. Có checkpoint để khởi tạo — thường là SFT (Stage 1, vd
+       checkpoints_sft/sft_best.pt), nhưng CŨNG dùng được checkpoint listwise
+       từ vòng trước (--sft-ckpt checkpoints_listwise/listwise_best.pt) nếu
+       đang chạy VÒNG LẶP tự cải thiện (label_selfcorrect_data.py → train
+       → dùng checkpoint mới label lại → train tiếp). Tên tham số giữ
+       "--sft-ckpt" vì trường hợp phổ biến nhất là Stage 1, nhưng về bản
+       chất chỉ là "checkpoint khởi tạo cho CẢ π_θ lẫn π_ref".
     2. Đã chạy scripts/label_selfcorrect_data.py → có data/gsm8k_selfcorrect/tiers.jsonl
        (KHÔNG phải data/gsm8k_dpo/pairs.jsonl — đó là pipeline DPO riêng,
        chỉ có 2 mức, không dùng được cho listwise 3 mức ở đây)
+
+CÓ VAL SPLIT + EVAL ĐỊNH KỲ (mỗi epoch) — quan trọng vì dataset thường nhỏ
+(vài trăm bài), rất dễ overfit nếu chỉ nhìn train loss. So sánh train_loss
+vs VAL_loss mỗi epoch để biết còn đang học tổng quát hay đã bắt đầu học
+thuộc lòng — đặc biệt cần chú ý nếu đang lặp nhiều vòng trên cùng 1 tập nhỏ.
 
 Usage:
     python train_listwise.py \
@@ -25,7 +36,7 @@ import torch
 from config import ModelConfig, get_100m_config
 from tokenizer import load_tokenizer
 from model import build_model
-from listwise_dataset import make_listwise_dataloader
+from listwise_dataset import make_listwise_dataloaders
 from trainer import run_listwise
 
 
@@ -39,6 +50,8 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=1e-6,
                    help="LR nhỏ giống DPO — vẫn là fine-tune tiếp trên tập preference nhỏ")
     p.add_argument("--beta",         type=float, default=0.1)
+    p.add_argument("--val-ratio",    type=float, default=0.1,
+                   help="Tỷ lệ tách val từ tiers.jsonl — cao hơn SFT (0.03) vì dataset nhỏ")
     p.add_argument("--save-dir",     type=str,   default="checkpoints_listwise")
     return p.parse_args()
 
@@ -77,13 +90,14 @@ def main():
     print(f"Total params: {model.num_params() / 1e6:.1f}M")
 
     # ── Data — cần 3 tier/bài (tier_correct_straight/tier_wrong_fixed/tier_wrong_raw) ──
-    train_loader = make_listwise_dataloader(
+    train_loader, val_loader = make_listwise_dataloaders(
         args.tiers_jsonl, tokenizer, batch_size=args.batch_size,
+        val_ratio=args.val_ratio,
     )
 
     # ── Train ────────────────────────────────────────────────────────────────
     run_listwise(
-        cfg, model, tokenizer, train_loader,
+        cfg, model, tokenizer, train_loader, val_loader,
         n_epochs=args.n_epochs, beta=args.beta,
         init_checkpoint=args.sft_ckpt,
     )

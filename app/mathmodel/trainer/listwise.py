@@ -87,12 +87,30 @@ class ListwiseTrainer(BaseTrainer):
 
         return {"loss": out["loss"].item(), "order_accuracy": out["order_accuracy"]}
 
+    @torch.no_grad()
+    def evaluate_listwise(self, val_loader) -> dict:
+        """Tính avg_loss/avg_order_acc trên val set — KHÔNG backward, KHÔNG
+        update ref_model/policy. Dùng để phát hiện overfit (so với train loss)."""
+        self.model.eval()
+        total_loss, total_acc, n_batches = 0.0, 0.0, 0
+
+        for batch in val_loader:
+            out = self.compute_listwise_loss(batch)
+            total_loss += out["loss"].item()
+            total_acc  += out["order_accuracy"]
+            n_batches  += 1
+
+        self.model.train()
+        n_batches = max(n_batches, 1)
+        return {"loss": total_loss / n_batches, "order_accuracy": total_acc / n_batches}
+
 
 def run_listwise(
     cfg,
     model,
     tokenizer,
     train_loader,
+    val_loader,
     n_epochs       : int   = 10,
     beta           : float = 0.1,
     init_checkpoint: str   = None,
@@ -104,15 +122,15 @@ def run_listwise(
                          xảy ra trong __init__), giống hệt lý do ở run_dpo().
     """
     if init_checkpoint:
-        print(f"\nKhởi tạo model từ checkpoint SFT: {init_checkpoint}")
+        print(f"\nKhởi tạo model từ checkpoint: {init_checkpoint}")
         load_checkpoint(init_checkpoint, model, device=cfg.train.device)
 
     trainer = ListwiseTrainer(cfg, model, tokenizer, beta=beta)
-    print("  ✓ π_ref = bản đóng băng của model NGAY SAU khi load checkpoint SFT ở trên")
+    print("  ✓ π_ref = bản đóng băng của model NGAY SAU khi load checkpoint ở trên")
 
     print(f"\n{'='*60}")
     print(f"  Listwise (Plackett-Luce) — {n_epochs} epoch(s) trên "
-          f"{len(train_loader.dataset)} bài, beta={beta}")
+          f"{len(train_loader.dataset)} bài train / {len(val_loader.dataset)} bài val, beta={beta}")
     print(f"{'='*60}")
 
     for epoch in range(n_epochs):
@@ -128,13 +146,28 @@ def run_listwise(
             print(f"  Step {trainer.global_step:>4} | loss: {out['loss']:.4f} | "
                   f"order_acc: {out['order_accuracy']*100:5.1f}%")
 
-        print(f"── Epoch {epoch+1}/{n_epochs} end | avg_loss: {ep_loss/n_batches:.4f} | "
-              f"avg_order_acc: {ep_acc/n_batches*100:.1f}% ──")
+        val_out = trainer.evaluate_listwise(val_loader)
+        print(f"── Epoch {epoch+1}/{n_epochs} end | "
+              f"train_loss: {ep_loss/n_batches:.4f} | train_order_acc: {ep_acc/n_batches*100:.1f}% | "
+              f"VAL_loss: {val_out['loss']:.4f} | VAL_order_acc: {val_out['order_accuracy']*100:.1f}% ──")
+
+        if val_out["loss"] < trainer.best_val_loss:
+            trainer.best_val_loss = val_out["loss"]
+            save_checkpoint(
+                f"{cfg.train.save_dir}/listwise_best.pt",
+                trainer.model, trainer.optimizer, trainer.scheduler,
+                trainer.global_step, chunk_idx=0, val_loss=val_out["loss"],
+                model_cfg=cfg.model,
+            )
+            print(f"  ✓ Cập nhật listwise_best.pt (val_loss={val_out['loss']:.4f})")
+        else:
+            print(f"  (val_loss không cải thiện — best hiện tại: {trainer.best_val_loss:.4f}, "
+                  f"có thể là dấu hiệu bắt đầu overfit nếu train_loss vẫn tiếp tục giảm)")
 
         save_checkpoint(
             f"{cfg.train.save_dir}/listwise_epoch_{epoch+1}.pt",
             trainer.model, trainer.optimizer, trainer.scheduler,
-            trainer.global_step, chunk_idx=0,
+            trainer.global_step, chunk_idx=0, val_loss=val_out["loss"],
             model_cfg=cfg.model,
         )
 
@@ -144,5 +177,7 @@ def run_listwise(
         trainer.global_step, chunk_idx=0,
         model_cfg=cfg.model,
     )
-    print(f"\n✓ Listwise training hoàn tất. Checkpoint cuối: {cfg.train.save_dir}/listwise_final.pt")
+    print(f"\n✓ Listwise training hoàn tất.")
+    print(f"  Checkpoint cuối       : {cfg.train.save_dir}/listwise_final.pt")
+    print(f"  Checkpoint tốt nhất (val_loss thấp nhất): {cfg.train.save_dir}/listwise_best.pt")
     return trainer

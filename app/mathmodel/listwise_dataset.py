@@ -16,7 +16,7 @@ thay vì 2.
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from sft_dataset import _build_example, load_jsonl
+from sft_dataset import _build_example, load_jsonl, split_train_val
 from dataset import collate_fn
 
 _RANK_KEYS = ("tier_correct_straight", "tier_wrong_fixed", "tier_wrong_raw")
@@ -65,15 +65,29 @@ def collate_listwise(batch: list[dict], pad_id: int) -> dict:
     return out
 
 
-def make_listwise_dataloader(
+def make_listwise_dataloaders(
     tiers_jsonl_path: str,
     tokenizer,
     batch_size: int,
-    shuffle   : bool = True,
-) -> DataLoader:
+    val_ratio : float = 0.1,
+    seed      : int   = 42,
+) -> tuple[DataLoader, DataLoader]:
+    """
+    Tách val NGAY TRONG tiers.jsonl (giống make_sft_dataloaders) — dataset
+    listwise thường nhỏ (vài trăm bài), val_ratio mặc định 0.1 (cao hơn SFT's
+    0.03) để có đủ mẫu val ý nghĩa dù tổng dataset nhỏ.
+    """
     rows = load_jsonl(tiers_jsonl_path)
-    print(f"  [make_listwise_dataloader] {len(rows)} bài từ {tiers_jsonl_path}")
+    train_rows, val_rows = split_train_val(rows, val_ratio=val_ratio, seed=seed)
 
-    ds = ListwiseDataset(rows, tokenizer)
+    print(f"  [make_listwise_dataloaders] train={len(train_rows)}  val={len(val_rows)}  "
+          f"(val_ratio={val_ratio}, tách nội bộ từ {tiers_jsonl_path})")
+
+    train_ds = ListwiseDataset(train_rows, tokenizer)
+    val_ds   = ListwiseDataset(val_rows,   tokenizer)
+
     collate = lambda b: collate_listwise(b, tokenizer.pad_id)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, collate_fn=collate, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  collate_fn=collate, num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate, num_workers=0)
+
+    return train_loader, val_loader
