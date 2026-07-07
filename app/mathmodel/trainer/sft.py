@@ -2,11 +2,15 @@
 trainer/sft.py — Supervised Fine-Tuning (Stage 1)
 ====================================================
 Khác PretrainTrainer: dataset SFT nhỏ (~7K sample, load hết vào RAM một
-lần), không cần logic chunk streaming của BaseTrainer.train_one_chunk
+lần), không cần logic CHUNK STREAMING của BaseTrainer.train_one_chunk
 (logic đó sinh ra để xử lý dataset lớn không load hết vào RAM được).
 
-Vì vậy KHÔNG dùng train_one_chunk() — tự viết loop epoch đơn giản, tái
-dùng train_one_batch()/evaluate()/logger đã có sẵn trong BaseTrainer.
+Vì vậy KHÔNG dùng train_one_chunk() — tự viết loop epoch riêng. Vẫn tái
+dùng _run_accum_window() (gom nhiều micro-batch thành 1 cửa sổ gradient
+accumulation, tự tính total_valid_tokens cho cả cửa sổ rồi mới gọi
+train_one_batch) — KHÔNG gọi train_one_batch() trực tiếp vì hàm đó cần
+total_valid_tokens của CẢ cửa sổ (không phải của riêng 1 batch) để chuẩn
+hóa loss đúng (xem comment trong trainer/base.py).
 
 KHÔNG gọi benchmark.run_all(): bộ benchmark đó là các câu hỏi TIẾNG VIỆT
 (semantic/entity/fact/ood), không đo được tiến độ SFT tiếng Anh trên
@@ -42,6 +46,39 @@ def _maybe_save_best(trainer: SFTTrainer, val_loss: float, cfg) -> bool:
         )
         return True
     return False
+
+
+def _run_window_correct_log(trainer: SFTTrainer, batches: list) -> None:
+    """
+    Giống hệt BaseTrainer._run_accum_window() ở phần backward/optimizer step
+    (KHÔNG đổi gì — gradient vẫn đúng, không cần sửa, không đụng base.py).
+
+    KHÁC ở chỗ: KHÔNG dùng thẳng giá trị loss train_one_batch() trả về để
+    log. train_one_batch() trả về loss_sum_của_batch_NÀY / total_valid_tokens
+    _của_CẢ_cửa_sổ — đúng cho backward (tổng theo cửa sổ ra gradient chuẩn),
+    nhưng SAI khi log trực tiếp: con số này bị "pha loãng" theo tỷ lệ
+    (tổng token cả cửa sổ ÷ token riêng batch này) — với grad_accum=64, số
+    hiển thị nhỏ hơn thật ~64 lần, khiến loss train trông như hội tụ về 0
+    trong khi thực ra không phải vậy.
+
+    Sửa: nhân NGƯỢC lại với total_valid_tokens (khôi phục loss_sum gốc của
+    riêng batch này), rồi chia cho SỐ TOKEN CỦA RIÊNG BATCH ĐÓ — ra đúng
+    loss trung bình/token của batch này, log giá trị ĐÃ SỬA này.
+    """
+    total_valid_tokens = sum((b["labels"] != -100).sum().item() for b in batches)
+    total_valid_tokens = max(total_valid_tokens, 1)
+
+    for i, batch in enumerate(batches):
+        is_last = (i == len(batches) - 1)
+        returned_loss = trainer.train_one_batch(batch, total_valid_tokens, is_last)
+
+        own_valid_tokens = max((batch["labels"] != -100).sum().item(), 1)
+        true_loss = returned_loss * total_valid_tokens / own_valid_tokens   # = loss_sum_batch_này / own_valid_tokens
+
+        trainer.logger.update(true_loss)
+        if trainer.logger.should_log():
+            lr = trainer.scheduler.get_last_lr()[0]
+            trainer.logger.flush(step=trainer.global_step, lr=lr)
 
 
 def run_sft(
